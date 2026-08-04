@@ -1,0 +1,41 @@
+FROM python:3.11-slim-bullseye
+
+ENV PYTHONUNBUFFERED=1
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/site-packages/nvidia/cuda_runtime/lib
+
+ARG USERNAME="admin"
+ARG USER_UID=1000
+ARG USER_GID=1000
+
+
+COPY ./JupyterNotebook /JupyterNotebook/
+
+
+RUN apt-get update \
+ && apt-get -y install nano procps wget tar build-essential git curl \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
+
+# Pre-build mlperf_loadgen (C++ extension — not on PyPI, must compile from source).
+# Sparse-clone only the loadgen/ directory to keep image size minimal.
+# Runs once at image build time so notebooks never need to compile anything.
+RUN git clone --depth 1 --filter=blob:none --sparse \
+        https://github.com/mlcommons/inference.git /tmp/mlperf_src \
+ && cd /tmp/mlperf_src \
+ && git sparse-checkout set loadgen \
+ && cd loadgen \
+ && CFLAGS="-std=c++14" pip install --no-cache-dir . \
+ && cd / && rm -rf /tmp/mlperf_src
+
+WORKDIR /JupyterNotebook
+RUN pip cache purge && \
+    python -m pip install --upgrade pip && \
+    pip3 install --no-cache-dir -r requirements.txt
+
+# Make all tools/ available as system commands
+RUN chmod +x /JupyterNotebook/tools/* \
+ && ln -s /JupyterNotebook/tools/ai-studio-cli  /usr/local/bin/ai-studio-cli \
+ && ln -s /JupyterNotebook/tools/check_p2p.py   /usr/local/bin/check-p2p \
+ && ln -s /JupyterNotebook/tools/enable_p2p.py  /usr/local/bin/enable-p2p
+
+CMD ["bash", "-c", "sh ./script.sh"]

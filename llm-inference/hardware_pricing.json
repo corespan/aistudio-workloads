@@ -1,0 +1,26 @@
+{
+  "meta": {
+    "last_updated_utc": "2026-05-20T00:00:00",
+    "electricity_kwh_usd": 0.12,
+    "note": "GPU capex figures are typical market estimates. Update to reflect your actual hardware cost."
+  },
+  "gpus": {
+    "Tesla T4":  { "capex_usd": 2500,  "lifespan_years": 4 },
+    "Tesla P40": { "capex_usd": 3000,  "lifespan_years": 4 },
+    "A100":      { "capex_usd": 15000, "lifespan_years": 4 },
+    "H100":      { "capex_usd": 30000, "lifespan_years": 4 },
+    "RTX 5090":  { "capex_usd": 6000,  "lifespan_years": 4 },
+    "DEFAULT":   { "capex_usd": 5000,  "lifespan_years": 4 }
+  },
+  "market_rates": {
+    "note": "Approximate spot/on-demand rates per GPU per hour. Update as market prices change.",
+    "gpus": {
+      "Tesla T4":  { "neocloud_hourly_usd": 0.25, "hyperscaler_hourly_usd": 0.53 },
+      "Tesla P40": { "neocloud_hourly_usd": 0.40, "hyperscaler_hourly_usd": 0.53 },
+      "A100":      { "neocloud_hourly_usd": 2.00, "hyperscaler_hourly_usd": 2.50 },
+      "H100":      { "neocloud_hourly_usd": 4.50, "hyperscaler_hourly_usd": 8.00 },
+      "RTX 5090":  { "neocloud_hourly_usd": 1.00, "hyperscaler_hourly_usd": 2.00 },
+      "DEFAULT":   { "neocloud_hourly_usd": 1.25, "hyperscaler_hourly_usd": 3.00 }
+    }
+  }
+}

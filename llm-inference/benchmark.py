@@ -95,6 +95,38 @@ def parse_args() -> argparse.Namespace:
 
 
 # ---------------------------------------------------------------------------
+# Dataset helpers
+# ---------------------------------------------------------------------------
+_SHAREGPT_URL = (
+    "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered"
+    "/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+)
+_SHAREGPT_CACHE = Path("/tmp/sharegpt/ShareGPT_V3_unfiltered_cleaned_split.json")
+
+
+def download_sharegpt() -> Path:
+    """Download the ShareGPT dataset if not already cached. Returns local path."""
+    if _SHAREGPT_CACHE.exists():
+        log.info("ShareGPT dataset found in cache: %s", _SHAREGPT_CACHE)
+        return _SHAREGPT_CACHE
+
+    log.info("Downloading ShareGPT dataset from HuggingFace …")
+    _SHAREGPT_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    with requests.get(_SHAREGPT_URL, stream=True, timeout=300) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0))
+        downloaded = 0
+        with open(_SHAREGPT_CACHE, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total:
+                    log.info("  %.1f / %.1f MB", downloaded / 1e6, total / 1e6)
+    log.info("ShareGPT dataset downloaded → %s", _SHAREGPT_CACHE)
+    return _SHAREGPT_CACHE
+
+
+# ---------------------------------------------------------------------------
 # File helpers
 # ---------------------------------------------------------------------------
 def write_json(path: Path, data: dict) -> None:
@@ -334,6 +366,14 @@ def main() -> None:
 
     set_status(log_dir, "Starting")
 
+    # ── Download ShareGPT dataset ────────────────────────────────────────────
+    try:
+        sharegpt_path = download_sharegpt()
+    except Exception as exc:
+        log.error("Failed to download ShareGPT dataset: %s", exc)
+        set_status(log_dir, "Failed", "could not download ShareGPT dataset")
+        sys.exit(1)
+
     # ── Validate concurrencies ───────────────────────────────────────────────
     try:
         concurrencies = [int(c.strip()) for c in args.concurrencies.split(",") if c.strip()]
@@ -415,6 +455,7 @@ def main() -> None:
             "--endpoint", "/v1/completions",
             "--model", args.model,
             "--dataset-name", "sharegpt",
+            "--dataset-path", str(sharegpt_path),
             "--num-prompts", "2", "--max-concurrency", "1",
             "--ignore-eos", "--percentile-metrics", "ttft,tpot,itl,e2el",
             "--profile", "--trust-remote-code",
@@ -447,6 +488,7 @@ def main() -> None:
             "--endpoint", "/v1/completions",
             "--model", args.model,
             "--dataset-name", "sharegpt",
+            "--dataset-path", str(sharegpt_path),
             "--num-prompts", str(10 * conc),
             "--max-concurrency", str(conc),
             "--ignore-eos",

@@ -34,4 +34,7 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt \
 WORKDIR /llm-inference
 COPY . /llm-inference/
 
+# Clear the vllm/vllm-openai base image ENTRYPOINT so docker run
+# commands can specify python3 directly without vllm intercepting them.
+ENTRYPOINT []
 CMD ["bash", "-c", "sh ./script.sh"]

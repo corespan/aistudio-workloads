@@ -37,6 +37,19 @@ open-source dependencies. Key packages and their licences:
 A full SBOM for each image is generated at release time via
 `make sbom` and published alongside the image in the container registry.
 
+The container images also include Debian/Ubuntu OS-level packages distributed
+under GPL-2.0-or-later and similar copyleft licences (including apt, gcc,
+build-essential, and related toolchain packages). These packages are not
+modified by CoreSpan. Corresponding source packages are available from the
+upstream archives:
+
+    https://deb.debian.org/debian/
+    https://archive.ubuntu.com/ubuntu/
+
+Written source offer: CoreSpan will provide copies of the corresponding source
+code for any GPL-covered OS package in these images upon written request sent
+to muraharirao@corespan.ai, valid for three years from the date of distribution.
+
 --------------------------------------------------------------------------------
 AI MODELS AND DATASETS
 --------------------------------------------------------------------------------

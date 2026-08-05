@@ -2,9 +2,13 @@
 """
 benchmark.py — LLM inference benchmarking for AIStudio (open-source edition).
 
-Starts a vLLM server, sweeps through concurrency levels using `vllm bench serve`
-with the ShareGPT dataset (downloaded automatically by vLLM on first run),
+Starts a vLLM server, sweeps through concurrency levels using `vllm bench serve`,
 and writes results to <output_data_path>/.
+
+The dataset must be supplied by the caller via --dataset-path. It must be a
+ShareGPT-format JSON file (a list of conversation objects). The file is not
+downloaded or fetched at runtime — the caller is responsible for placing it on
+the GPU node before the benchmark runs.
 
 Usage (standalone):
     python3 benchmark.py \
@@ -12,7 +16,8 @@ Usage (standalone):
         --output_data_path /results/run-001 \
         --run_name tinyllama-tp1 \
         --tp 1 \
-        --concurrencies 32,64,128
+        --concurrencies 32,64,128 \
+        --dataset-path /datasets/sharegpt.json
 
 Results are written to:
     <output_data_path>/benchmark_result.json  — raw per-concurrency rows (jsonl)
@@ -84,46 +89,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--enable_profiler", action="store_true",
                    help="Run a 2-request profiler warmup and save Torch traces")
 
+    # Dataset
+    p.add_argument("--dataset-path", required=True,
+                   help="Path to a ShareGPT-format JSON dataset file on the local filesystem. "
+                        "Must be provided — no automatic download is performed.")
+
     # Optional: GPU power monitoring via Prometheus
     p.add_argument("--enable_power_metrics", action="store_true",
                    help="Collect GPU power and utilisation via Prometheus")
     p.add_argument("--prometheus_url", default="http://localhost:9090",
                    help="Prometheus server URL (used only with --enable_power_metrics)")
 
-
     return p.parse_args()
-
-
-# ---------------------------------------------------------------------------
-# Dataset helpers
-# ---------------------------------------------------------------------------
-_SHAREGPT_URL = (
-    "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered"
-    "/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
-)
-_SHAREGPT_CACHE = Path("/tmp/sharegpt/ShareGPT_V3_unfiltered_cleaned_split.json")
-
-
-def download_sharegpt() -> Path:
-    """Download the ShareGPT dataset if not already cached. Returns local path."""
-    if _SHAREGPT_CACHE.exists():
-        log.info("ShareGPT dataset found in cache: %s", _SHAREGPT_CACHE)
-        return _SHAREGPT_CACHE
-
-    log.info("Downloading ShareGPT dataset from HuggingFace …")
-    _SHAREGPT_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    with requests.get(_SHAREGPT_URL, stream=True, timeout=300) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("content-length", 0))
-        downloaded = 0
-        with open(_SHAREGPT_CACHE, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    log.info("  %.1f / %.1f MB", downloaded / 1e6, total / 1e6)
-    log.info("ShareGPT dataset downloaded → %s", _SHAREGPT_CACHE)
-    return _SHAREGPT_CACHE
 
 
 # ---------------------------------------------------------------------------
@@ -366,13 +343,13 @@ def main() -> None:
 
     set_status(log_dir, "Starting")
 
-    # ── Download ShareGPT dataset ────────────────────────────────────────────
-    try:
-        sharegpt_path = download_sharegpt()
-    except Exception as exc:
-        log.error("Failed to download ShareGPT dataset: %s", exc)
-        set_status(log_dir, "Failed", "could not download ShareGPT dataset")
+    # ── Validate dataset path ────────────────────────────────────────────────
+    dataset_path = Path(args.dataset_path)
+    if not dataset_path.exists():
+        log.error("Dataset file not found: %s", dataset_path)
+        set_status(log_dir, "Failed", "dataset file not found: %s" % dataset_path)
         sys.exit(1)
+    log.info("Dataset: %s", dataset_path)
 
     # ── Validate concurrencies ───────────────────────────────────────────────
     try:
@@ -455,7 +432,7 @@ def main() -> None:
             "--endpoint", "/v1/completions",
             "--model", args.model,
             "--dataset-name", "sharegpt",
-            "--dataset-path", str(sharegpt_path),
+            "--dataset-path", str(dataset_path),
             "--num-prompts", "2", "--max-concurrency", "1",
             "--ignore-eos", "--percentile-metrics", "ttft,tpot,itl,e2el",
             "--profile", "--trust-remote-code",
@@ -488,7 +465,7 @@ def main() -> None:
             "--endpoint", "/v1/completions",
             "--model", args.model,
             "--dataset-name", "sharegpt",
-            "--dataset-path", str(sharegpt_path),
+            "--dataset-path", str(dataset_path),
             "--num-prompts", str(10 * conc),
             "--max-concurrency", str(conc),
             "--ignore-eos",

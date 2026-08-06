@@ -1,0 +1,5 @@
+# Additional packages on top of vllm/vllm-openai base image.
+# vLLM, PyTorch, CUDA runtime, and FlashAttention are already in the base —
+# do not re-add them here.
+psutil>=5.9.0
+requests>=2.31.0

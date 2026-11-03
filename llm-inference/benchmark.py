@@ -5,10 +5,15 @@ benchmark.py — LLM inference benchmarking for AIStudio (open-source edition).
 Starts a vLLM server, sweeps through concurrency levels using `vllm bench serve`,
 and writes results to <output_data_path>/.
 
-The dataset must be supplied by the caller via --dataset-path. It must be a
-ShareGPT-format JSON file (a list of conversation objects). The file is not
-downloaded or fetched at runtime — the caller is responsible for placing it on
-the GPU node before the benchmark runs.
+The dataset is chosen by the caller: --dataset-name is any type `vllm bench serve`
+accepts (default sharegpt, a JSON list of conversations; custom is JSONL with a
+"prompt" field per line; random needs no file). --dataset-path points to the file
+for the file-based types. The file is not downloaded or fetched at runtime — the
+caller is responsible for placing it on the GPU node before the benchmark runs.
+
+Model-specific vLLM flags go through --extra_serve_args, and dataset-specific
+`vllm bench serve` flags (e.g. --custom-output-len, --random-input-len) through
+--extra_bench_args, so no model or dataset needs a change to this script.
 
 Usage (standalone):
     python3 benchmark.py \
@@ -18,6 +23,11 @@ Usage (standalone):
         --tp 1 \
         --concurrencies 32,64,128 \
         --dataset-path /datasets/sharegpt.json
+
+    # Any other dataset type, e.g. a JSONL file of {"prompt": ...} lines:
+    python3 benchmark.py ... \
+        --dataset-name custom --dataset-path /datasets/prompts.jsonl \
+        --extra_bench_args "--custom-output-len 128"
 
 Results are written to:
     <output_data_path>/benchmark_result.json  — raw per-concurrency rows (jsonl)
@@ -29,6 +39,8 @@ import argparse
 import json
 import logging
 import os
+import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -54,6 +66,10 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger(__name__)
+
+
+# Dataset types `vllm bench serve` generates prompts for itself: no --dataset-path.
+SELF_GENERATED_DATASETS = {"random", "random-mm", "random-rerank", "prefix_repetition"}
 
 
 # ---------------------------------------------------------------------------
@@ -89,10 +105,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--enable_profiler", action="store_true",
                    help="Run a 2-request profiler warmup and save Torch traces")
 
+    p.add_argument("--server_timeout", type=int, default=0,
+                   help="Total seconds to wait for the vLLM server to come up; 0 = no limit "
+                        "(a large model on network storage can load for an hour). A fatal "
+                        "vLLM error fails the run at once either way.")
+    p.add_argument("--server_stall_timeout", type=int, default=1800,
+                   help="Fail if the vLLM server prints nothing for this many seconds while "
+                        "loading (hung); 0 = never.")
+    p.add_argument("--extra_serve_args", default="",
+                   help="Extra flags passed as-is to `vllm serve`, e.g. "
+                        "\"--gpu-memory-utilization 0.95 --kv-cache-dtype fp8\"")
+
     # Dataset
-    p.add_argument("--dataset-path", required=True,
-                   help="Path to a ShareGPT-format JSON dataset file on the local filesystem. "
-                        "Must be provided — no automatic download is performed.")
+    p.add_argument("--dataset-name", default="sharegpt",
+                   help="Any dataset type `vllm bench serve` accepts: sharegpt (JSON list "
+                        "of conversations), custom (JSONL with a 'prompt' field), random "
+                        "(no file), hf, sonnet, burstgpt, ...")
+    p.add_argument("--dataset-path", default=None,
+                   help="Dataset file on the local filesystem (or the HF dataset id for "
+                        "--dataset-name hf). Required unless the dataset type generates "
+                        "its own prompts. No automatic download is performed.")
+    p.add_argument("--extra_bench_args", default="",
+                   help="Extra flags passed as-is to `vllm bench serve`, e.g. "
+                        "\"--custom-output-len 128\" or \"--random-input-len 512 "
+                        "--random-output-len 128\"")
 
     # Optional: GPU power monitoring via Prometheus
     p.add_argument("--enable_power_metrics", action="store_true",
@@ -161,23 +197,99 @@ def get_gpu_uuids(count: int) -> list[str]:
         return []
 
 
-def wait_server_ready(server: subprocess.Popen, port: int, timeout: int = 600) -> None:
-    """Poll /v1/models until the vLLM server responds 200 or *timeout* seconds elapse."""
+# Lines vLLM prints when the server can no longer come up. Its API server process
+# can outlive a dead engine, so waiting for it to exit is not enough.
+FATAL_SERVER_OUTPUT = (
+    "EngineCore failed to start",
+    "Engine core initialization failed",
+    "CUDA out of memory",
+    "torch.OutOfMemoryError",
+    "No available memory for the cache blocks",
+)
+
+
+# The exception a traceback ends in: "ValueError: Free memory on device ...".
+_EXCEPTION_RE = re.compile(r"\b([A-Za-z_.]*(?:Error|Exception)): (.+)")
+
+
+class ServerOutput:
+    """
+    Reads the vLLM server's output (stdout and stderr together) on a thread for
+    the server's whole life: passes every line through to our stdout, remembers
+    when the last one came, and notes the first line that means the server is
+    dead. Reading it is also what keeps vLLM from blocking on a full pipe.
+    """
+
+    def __init__(self, server: subprocess.Popen):
+        self.last_output = time.monotonic()
+        self.fatal: str | None = None
+        self.lines_since_fatal: list[str] = []
+        self._server = server
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self) -> None:
+        for line in iter(self._server.stdout.readline, ""):
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            self.last_output = time.monotonic()
+            if self.fatal is None and any(p in line for p in FATAL_SERVER_OUTPUT):
+                self.fatal = line.strip()
+            if self.fatal is not None and len(self.lines_since_fatal) < 500:
+                self.lines_since_fatal.append(line.strip())
+
+    def cause(self, settle: float = 2.0) -> str:
+        """
+        Why the server died, in one line. The fatal line is usually generic
+        ("EngineCore failed to start."); the traceback after it ends in the real
+        reason ("ValueError: Free memory on device cuda:0 (7.96/14.56 GiB) ...").
+        Waits up to *settle* seconds for that traceback to finish printing.
+        """
+        deadline = time.monotonic() + settle
+        while time.monotonic() < deadline and time.monotonic() - self.last_output < 0.5:
+            time.sleep(0.1)
+        for line in reversed(self.lines_since_fatal):
+            match = _EXCEPTION_RE.search(line)
+            if match:
+                return "%s: %s" % match.groups()
+        return self.fatal or "unknown error"
+
+
+def wait_server_ready(server: subprocess.Popen, port: int, output: ServerOutput,
+                      timeout: int = 0, stall_timeout: int = 1800, poll: float = 2.0) -> None:
+    """
+    Poll /v1/models every *poll* seconds until vLLM answers 200. There is no fixed
+    limit by default: a large model on network storage can load for an hour, and
+    while it keeps printing progress it is working. It fails fast instead when
+
+      - vLLM prints a fatal error (FATAL_SERVER_OUTPUT), or its process exits;
+      - vLLM prints nothing for *stall_timeout* seconds (0 = never), i.e. hung;
+      - *timeout* seconds pass in total, when the caller sets one (0 = none).
+    """
     url = f"http://127.0.0.1:{port}/v1/models"
-    for elapsed in range(timeout):
-        if server.poll() not in (None, 0):
-            stderr = server.stderr.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"vLLM server exited prematurely:\n{stderr.strip()}")
+    start = time.monotonic()
+    next_note = 30
+    while True:
+        elapsed = time.monotonic() - start
+        if output.fatal:
+            raise RuntimeError(f"vLLM server failed while loading: {output.cause()}")
+        code = server.poll()
+        if code is not None:
+            raise RuntimeError(f"vLLM server exited with code {code} before it was ready")
         try:
             if requests.get(url, timeout=2).status_code == 200:
                 log.info("vLLM server ready after %ds", elapsed)
                 return
         except Exception:
             pass
-        if elapsed > 0 and elapsed % 30 == 0:
-            log.info("Waiting for vLLM server on port %d … (%ds / %ds)", port, elapsed, timeout)
-        time.sleep(1)
-    raise RuntimeError(f"vLLM server did not become ready within {timeout}s")
+        quiet = time.monotonic() - output.last_output
+        if stall_timeout and quiet > stall_timeout:
+            raise RuntimeError(f"vLLM server printed nothing for {int(quiet)}s: hung while loading")
+        if timeout and elapsed > timeout:
+            raise RuntimeError(f"vLLM server did not become ready within {timeout}s")
+        if elapsed >= next_note:
+            log.info("Still loading the model … %ds (last vLLM output %ds ago)", elapsed, quiet)
+            next_note += 30
+        time.sleep(poll)
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +384,7 @@ def aggregate_results(
         "duration", "total_input_tokens", "total_output_tokens",
         "output_throughput", "total_token_throughput", "request_throughput",
         "mean_ttft_ms", "p99_ttft_ms", "mean_tpot_ms", "mean_e2el_ms",
-        "p50_e2el_ms", "p99_e2el_ms",
+        "median_e2el_ms", "p99_e2el_ms",
         # vllm bench serve calls these num_prompts / completed
         "num_prompts", "completed",
     ]
@@ -292,6 +404,10 @@ def aggregate_results(
 
             m: dict = {k: round(v, 2) for k in required_keys
                        if isinstance((v := row.get(k)), (int, float))}
+            # vllm bench serve reports the 50th percentile as median_*; p50 is
+            # the name summary.json and BENCH_RESULT have always used.
+            if "median_e2el_ms" in m:
+                m["p50_e2el_ms"] = m.pop("median_e2el_ms")
 
             conc_int = int(conc)
             if args.enable_power_metrics and conc_int in power_map:
@@ -343,13 +459,28 @@ def main() -> None:
 
     set_status(log_dir, "Starting")
 
-    # ── Validate dataset path ────────────────────────────────────────────────
-    dataset_path = Path(args.dataset_path)
-    if not dataset_path.exists():
-        log.error("Dataset file not found: %s", dataset_path)
-        set_status(log_dir, "Failed", "dataset file not found: %s" % dataset_path)
+    # ── Validate dataset ─────────────────────────────────────────────────────
+    # Types that generate their own prompts need no file; hf takes a dataset id
+    # rather than a local path. Every other type reads the file at --dataset-path.
+    dataset_args = ["--dataset-name", args.dataset_name]
+    if args.dataset_path:
+        dataset_args += ["--dataset-path", args.dataset_path]
+        if args.dataset_name != "hf" and not Path(args.dataset_path).exists():
+            log.error("Dataset file not found: %s", args.dataset_path)
+            set_status(log_dir, "Failed", "dataset file not found: %s" % args.dataset_path)
+            sys.exit(1)
+    elif args.dataset_name not in SELF_GENERATED_DATASETS:
+        log.error("--dataset-path is required for --dataset-name %s", args.dataset_name)
+        set_status(log_dir, "Failed", "no dataset path for %s" % args.dataset_name)
         sys.exit(1)
-    log.info("Dataset: %s", dataset_path)
+    try:
+        extra_serve_args = shlex.split(args.extra_serve_args)
+        extra_bench_args = shlex.split(args.extra_bench_args)
+    except ValueError as exc:
+        log.error("Could not parse extra args: %s", exc)
+        set_status(log_dir, "Failed", "unparsable extra args")
+        sys.exit(1)
+    log.info("Dataset: %s %s", args.dataset_name, args.dataset_path or "(generated)")
 
     # ── Validate concurrencies ───────────────────────────────────────────────
     try:
@@ -382,6 +513,7 @@ def main() -> None:
     ]
     if args.max_model_len:
         serve_cmd += ["--max-model-len", str(args.max_model_len)]
+    serve_cmd += extra_serve_args
     if args.enable_optimizations:
         # sm80+ only (Ampere / Hopper / Blackwell). Skip for T4 / V100.
         serve_cmd += ["--compilation-config", '{"cudagraph_mode": "FULL"}', "-O3"]
@@ -391,7 +523,9 @@ def main() -> None:
 
     # ── Start vLLM server ────────────────────────────────────────────────────
     log.info("Starting vLLM server — tp=%d, port=%d", args.tp, port)
-    server = subprocess.Popen(serve_cmd, stderr=subprocess.PIPE, start_new_session=False)
+    server = subprocess.Popen(serve_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True, errors="replace", bufsize=1, start_new_session=False)
+    server_output = ServerOutput(server)
 
     monitor: GPUMonitor | None = None
     _shutdown_done = False
@@ -414,10 +548,11 @@ def main() -> None:
     signal.signal(signal.SIGTERM, shutdown)
 
     try:
-        wait_server_ready(server, port)
+        wait_server_ready(server, port, server_output,
+                          timeout=args.server_timeout, stall_timeout=args.server_stall_timeout)
     except RuntimeError as exc:
         log.error("Server failed to start: %s", exc)
-        set_status(log_dir, "Failed", "vLLM server did not start")
+        set_status(log_dir, "Failed", str(exc))
         shutdown(exit_code=1)
 
     set_status(log_dir, "Running")
@@ -431,11 +566,11 @@ def main() -> None:
             "--host", "127.0.0.1", "--port", str(port),
             "--endpoint", "/v1/completions",
             "--model", args.model,
-            "--dataset-name", "sharegpt",
-            "--dataset-path", str(dataset_path),
+            *dataset_args,
             "--num-prompts", "2", "--max-concurrency", "1",
             "--ignore-eos", "--percentile-metrics", "ttft,tpot,itl,e2el",
             "--profile", "--trust-remote-code",
+            *extra_bench_args,
         ]
         subprocess.run(warmup_cmd, check=True)
         log.info("Profiler warmup done — traces saved to %s", prof_dir)
@@ -464,8 +599,7 @@ def main() -> None:
             "--host", "127.0.0.1", "--port", str(port),
             "--endpoint", "/v1/completions",
             "--model", args.model,
-            "--dataset-name", "sharegpt",
-            "--dataset-path", str(dataset_path),
+            *dataset_args,
             "--num-prompts", str(10 * conc),
             "--max-concurrency", str(conc),
             "--ignore-eos",
@@ -475,6 +609,7 @@ def main() -> None:
             "--result-filename", "benchmark_result.json",
             "--metadata", f"concurrency={conc}",
             "--trust-remote-code",
+            *extra_bench_args,
         ]
 
         if monitor:

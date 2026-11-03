@@ -23,12 +23,13 @@ docker run --gpus all --rm \
   -v /path/to/results:/results \
   -v /path/to/dataset.json:/path/to/dataset.json \
   --entrypoint python3 \
-  us-docker.pkg.dev/aimlworkbench/aistudio/llminference:1.0.0-nvidia \
+  us-docker.pkg.dev/aimlworkbench/aistudio/llminference:1.1.0-nvidia \
   /llm-inference/benchmark.py \
     --model mistralai/Mistral-7B-Instruct-v0.3 \
     --dataset-path /path/to/dataset.json \
     --concurrencies 4 \
-    --output_data_path /results/run1
+    --output_data_path /results/run1 \
+    --run_name run1
 
 # Jupyter Notebook
 docker run --gpus all -d \
@@ -39,7 +40,18 @@ docker run --gpus all -d \
   us-docker.pkg.dev/aimlworkbench/aistudio/jupyternotebook:1.0.0-nvidia
 ```
 
-**Dataset:** The LLM benchmark requires a ShareGPT-format JSON file on the GPU node. No dataset is bundled or auto-downloaded. You can use [OpenOrca (MIT)](https://huggingface.co/datasets/Open-Orca/OpenOrca) or [Dolly (CC-BY-SA-3.0)](https://huggingface.co/datasets/databricks/databricks-dolly-15k) as clean alternatives.
+**Dataset:** Any dataset type `vllm bench serve` supports, chosen with `--dataset-name` (default `sharegpt`, a JSON list of conversations). Common choices:
+
+| `--dataset-name` | `--dataset-path` | Notes |
+|---|---|---|
+| `sharegpt` (default) | JSON list of conversations | |
+| `custom` | JSONL, one `{"prompt": "..."}` per line | output length via `--extra_bench_args "--custom-output-len 128"` |
+| `random` | none | lengths via `--extra_bench_args "--random-input-len 512 --random-output-len 128"` |
+| `hf` | a Hugging Face dataset id | needs internet |
+
+No dataset is bundled or auto-downloaded. You can use [OpenOrca (MIT)](https://huggingface.co/datasets/Open-Orca/OpenOrca) or [Dolly (CC-BY-SA-3.0)](https://huggingface.co/datasets/databricks/databricks-dolly-15k) as clean alternatives.
+
+**Model-specific settings:** `--extra_serve_args` passes flags straight to `vllm serve` (for example `"--gpu-memory-utilization 0.95 --kv-cache-dtype fp8"`), and loading has no fixed time limit: the script checks the vLLM server every 2 s, fails at once on a fatal vLLM error (out of memory, engine failed to start), and otherwise waits as long as vLLM keeps printing progress. `--server_stall_timeout` (default 1800 s) fails a load that prints nothing for that long; `--server_timeout` adds a total limit if you want one (default 0, none). The model can be a Hugging Face id or a local path, such as weights on an NFS mount.
 
 ## Integration with AIStudio Server
 

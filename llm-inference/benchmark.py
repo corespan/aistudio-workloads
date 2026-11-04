@@ -33,6 +33,8 @@ Results are written to:
     <output_data_path>/benchmark_result.json  — raw per-concurrency rows (jsonl)
     <output_data_path>/summary.json           — aggregated metrics + cost estimates
     <output_data_path>/logs/status.json       — current run status
+    <output_data_path>/interconnect.json      — PCIe links, P2P access and nvbandwidth
+                                                results (with --interconnect_check)
 """
 
 import argparse
@@ -52,6 +54,7 @@ import psutil
 import requests
 import urllib3
 
+import interconnect
 from costEngine import CostEngine
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -130,6 +133,13 @@ def parse_args() -> argparse.Namespace:
                         "\"--custom-output-len 128\" or \"--random-input-len 512 "
                         "--random-output-len 128\"")
 
+    # Optional: how the GPUs are connected, measured before vLLM starts
+    p.add_argument("--interconnect_check", action="store_true",
+                   help="Record PCIe links, GPU peer (P2P) access and nvbandwidth results "
+                        "to interconnect.json. GPUs without P2P are logged, never fatal")
+    p.add_argument("--interconnect_timeout", type=int, default=900,
+                   help="Seconds the bandwidth test may take")
+
     # Optional: GPU power monitoring via Prometheus
     p.add_argument("--enable_power_metrics", action="store_true",
                    help="Collect GPU power and utilisation via Prometheus")
@@ -195,6 +205,24 @@ def get_gpu_uuids(count: int) -> list[str]:
     except Exception as exc:
         log.warning("Could not query GPU UUIDs: %s", exc)
         return []
+
+
+def log_interconnect(result: dict) -> None:
+    """One readable line per GPU and per test, so the run log shows what interconnect.json holds."""
+    for gpu in result.get("gpus", []):
+        log.info("GPU %s %s %s: PCIe gen %s/%s x%s/x%s (current/max)",
+                 gpu["index"], gpu["name"], gpu["pci_bus_id"], gpu["pcie_gen_current"],
+                 gpu["pcie_gen_max"], gpu["pcie_width_current"], gpu["pcie_width_max"])
+    if result.get("p2p_missing"):
+        log.warning("No P2P detected between %s",
+                    ", ".join("GPU %d and GPU %d" % p
+                              for p in sorted({tuple(sorted(p)) for p in result["p2p_missing"]})))
+    elif result.get("p2p") is not None and len(result["p2p"]) >= 2:
+        log.info("P2P available between every pair of GPUs")
+    for test in (result.get("bandwidth") or {}).get("tests", []):
+        log.info("nvbandwidth %s: %s, sum %s GB/s", test["name"], test["status"], test["sum"])
+    for view, error in result.get("errors", {}).items():
+        log.warning("Interconnect %s not collected: %s", view, error)
 
 
 # Lines vLLM prints when the server can no longer come up. Its API server process
@@ -489,6 +517,14 @@ def main() -> None:
     except (ValueError, AssertionError) as exc:
         log.error("Invalid --concurrencies '%s': %s", args.concurrencies, exc)
         sys.exit(1)
+
+    # ── Interconnect check (optional) ────────────────────────────────────────
+    # Before vLLM starts, so the bandwidth test has the GPUs and the link to itself.
+    if args.interconnect_check:
+        set_status(log_dir, "Checking interconnect")
+        result = interconnect.check(output_dir, args.interconnect_timeout)
+        log_interconnect(result)
+        print("INTERCONNECT_RESULT:" + json.dumps(result), flush=True)
 
     # ── Profiler setup ───────────────────────────────────────────────────────
     prof_dir: Path | None = None

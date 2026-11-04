@@ -53,6 +53,14 @@ No dataset is bundled or auto-downloaded. You can use [OpenOrca (MIT)](https://h
 
 **Model-specific settings:** `--extra_serve_args` passes flags straight to `vllm serve` (for example `"--gpu-memory-utilization 0.95 --kv-cache-dtype fp8"`), and loading has no fixed time limit: the script checks the vLLM server every 2 s, fails at once on a fatal vLLM error (out of memory, engine failed to start), and otherwise waits as long as vLLM keeps printing progress. `--server_stall_timeout` (default 1800 s) fails a load that prints nothing for that long; `--server_timeout` adds a total limit if you want one (default 0, none). The model can be a Hugging Face id or a local path, such as weights on an NFS mount.
 
+**GPU interconnect:** `--interconnect_check` measures, before vLLM starts, how the GPUs given to the container are connected, and writes it to `interconnect.json` (also printed as one `INTERCONNECT_RESULT:` line):
+
+- PCIe bus id and link generation/width (current and max) per GPU, from `nvidia-smi`;
+- whether each pair of GPUs can reach the other peer to peer (P2P);
+- [NVIDIA nvbandwidth](https://github.com/NVIDIA/nvbandwidth) copy bandwidth host↔GPU for every GPU, and GPU↔GPU plus latency with two or more GPUs.
+
+GPUs without P2P are logged ("No P2P detected between GPU 0 and GPU 1") and the run continues. `--interconnect_timeout` (default 900 s) bounds the bandwidth test. Off unless the flag is given.
+
 ## Integration with AIStudio Server
 
 When used with [AIStudio Server](https://github.com/corespan/aistudio-server), these workloads are orchestrated automatically — the server handles node selection, SSH execution, result collection, and the benchmark dashboard.

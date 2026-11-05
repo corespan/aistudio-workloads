@@ -8,17 +8,18 @@ workload_id = os.environ.get("workload_id", "wl_unknown")
 # Without this, JupyterLab serves all assets from / and breaks behind a subpath.
 base_url = os.environ.get("JUPYTER_BASE_URL", "/")
 
+# Who may open the notebook: Jupyter reads the token from JUPYTER_TOKEN in the
+# environment (AI Studio sets it, one per notebook, and hands it only to the
+# notebook's owner). With no JUPYTER_TOKEN, Jupyter makes up a random one and
+# prints it in its log, so the server never runs without a password. The token
+# is not passed on the command line, where any process on the node could read it.
 jupyter_cmd = [
     "jupyter", "notebook",
     "--no-browser",
     "--ip=0.0.0.0",
     f"--port={workload_port}",
-    "--NotebookApp.token=",
-    "--NotebookApp.password=''",
     "--allow-root",
     f"--ServerApp.base_url={base_url}",
-    "--ServerApp.allow_origin=*",       # required when served via HTTPS reverse proxy
-    "--ServerApp.disable_check_xsrf=True",  # XSRF cookie check breaks behind HTTPS proxy
 ]
 
 

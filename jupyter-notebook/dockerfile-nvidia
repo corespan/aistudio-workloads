@@ -1,4 +1,28 @@
-FROM python:3.11-slim-bullseye
+# Jupyter Notebook workload.
+#
+# The terminal carries ai-studio-cli, whose `nvbandwidth` commands run NVIDIA
+# nvbandwidth (host<->GPU and GPU<->GPU copy bandwidth, P2P included). It is
+# built in its own stage so no compiler reaches the final image, on Ubuntu 22.04
+# (glibc 2.35), which runs on this Debian bookworm image (glibc 2.36). The
+# build has no GPU to detect, so the architectures are listed: Pascal (P40) to
+# Blackwell as machine code, plus PTX of the newest for later GPUs.
+ARG NVBANDWIDTH_VERSION=v0.8
+ARG NVBANDWIDTH_CUDA_ARCHS="61-real;70-real;75-real;80-real;86-real;89-real;90-real;120"
+
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04 AS nvbandwidth
+ARG NVBANDWIDTH_VERSION
+ARG NVBANDWIDTH_CUDA_ARCHS
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git cmake build-essential libboost-program-options-dev \
+ && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch "${NVBANDWIDTH_VERSION}" https://github.com/NVIDIA/nvbandwidth /src \
+ && cmake -S /src -B /build -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_ARCHITECTURES=${NVBANDWIDTH_CUDA_ARCHS}" \
+ && cmake --build /build -j"$(nproc)"
+
+# Debian 12. Debian 11 (bullseye) reached the end of its support in 2026 and its
+# packages are leaving deb.debian.org, so its apt installs fail.
+FROM python:3.11-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1
 ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/site-packages/nvidia/cuda_runtime/lib
@@ -6,9 +30,6 @@ ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/site-packages/nvidia/cuda_runtime/
 ARG USERNAME="admin"
 ARG USER_UID=1000
 ARG USER_GID=1000
-
-
-COPY . /JupyterNotebook/
 
 
 RUN apt-get update \
@@ -27,10 +48,18 @@ RUN git clone --depth 1 --filter=blob:none --sparse \
  && CFLAGS="-std=c++14" pip install --no-cache-dir . \
  && cd / && rm -rf /tmp/mlperf_src
 
+# Python packages first, on their own: a change to a notebook or a tool then
+# rebuilds in seconds instead of reinstalling vLLM and PyTorch.
 WORKDIR /JupyterNotebook
+COPY requirements.txt /JupyterNotebook/requirements.txt
 RUN pip cache purge && \
     python -m pip install --upgrade pip && \
     pip3 install --no-cache-dir -r requirements.txt
+
+# nvbandwidth, for ai-studio-cli's bandwidth tests (it looks in PATH).
+COPY --from=nvbandwidth /build/nvbandwidth /usr/local/bin/nvbandwidth
+
+COPY . /JupyterNotebook/
 
 # Make all tools/ available as system commands
 RUN chmod +x /JupyterNotebook/tools/* \

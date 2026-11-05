@@ -78,7 +78,7 @@ def main():
         print("✓ All GPU pairs support P2P access.")
     else:
         print("✗ Some pairs lack P2P support.")
-        print("  Run enable_p2p.py to attempt enabling it.")
+        print("  Those pairs have no direct path; data between them goes through the CPU.")
 
 if __name__ == "__main__":
     main()

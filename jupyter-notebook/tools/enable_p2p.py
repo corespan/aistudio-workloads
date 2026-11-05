@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-enable_p2p.py — Enable CUDA peer-to-peer access between all GPU pairs.
+enable_p2p.py — Try enabling CUDA peer-to-peer access between every GPU pair.
 
-Checks each pair first. Skips pairs that don't support P2P at the hardware
-level (e.g. GPUs on different NUMA nodes without NVLink/NVSwitch).
+CUDA peer access is switched on per process: it lasts only while the process
+that asked for it runs. So this does not leave P2P "on" for your notebook or
+for vLLM. It proves which pairs CAN be enabled (PyTorch, NCCL and vLLM enable
+it themselves when they need it). Pairs the hardware cannot connect are skipped.
 
 Usage (Jupyter terminal):
     python enable_p2p.py
@@ -70,7 +72,7 @@ def main():
                 failed.append((i, j, ret))
 
     if enabled:
-        print("Enabled:")
+        print("Can be enabled (enabled for this check only):")
         for i, j in enabled:
             print(f"  GPU{i} → GPU{j}")
 
@@ -91,10 +93,10 @@ def main():
 
     print()
     if not failed and not skipped:
-        print("✓ P2P enabled for all GPU pairs.")
+        print("✓ Every GPU pair can use P2P. Programs enable it for themselves when they run.")
     elif not failed and skipped:
-        print("✓ P2P enabled where hardware supports it.")
-        print("  Skipped pairs lack NVLink/NVSwitch — P2P not possible on those.")
+        print("✓ P2P works where the hardware allows it.")
+        print("  Skipped pairs have no direct path (no NVLink/NVSwitch or PCIe peer route).")
     else:
         print("✗ Some pairs failed. Check CUDA error codes above.")
         sys.exit(1)
